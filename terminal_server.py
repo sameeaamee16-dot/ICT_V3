@@ -68,6 +68,7 @@ from auto_upgrade_engine import AutoUpgradeEngine
 from config import CONFIG
 from data_feed import create_feed
 from database import MySQLStore
+from backtester import HistoryBacktestRunner    # AUTO HISTORY LEARNING
 from filter_engine import FilterEngine          # BUG FIX 1
 from logger import get_logger
 from models import IctSnapshot, Signal, Trade
@@ -137,6 +138,8 @@ class BotRuntime:
         self.ai_advisor = AIAdvisor()
         self.upgrade_engine = AutoUpgradeEngine()
         self.filter_engine = FilterEngine()        # BUG FIX 1
+        self.history_runner = HistoryBacktestRunner()  # AUTO HISTORY LEARNING
+        self._backtest_result: Optional[dict] = None
 
         self.store: MySQLStore | None = None
         self.status = "starting"
@@ -190,6 +193,26 @@ class BotRuntime:
             if self.upgrade_engine.pause_reason:
                 self._message(f"[AUTO-UPGRADE] {self.upgrade_engine.pause_reason}")
             self._refresh_adaptive_trainer()
+
+            # AUTO HISTORY LEARNING: run backtest in background so startup isn't blocked
+            def _run_history():
+                try:
+                    self._message("History analyser: loading MT5 candle history...")
+                    result = self.history_runner.run_if_needed()
+                    if result:
+                        self._backtest_result = result
+                        wr = result.get("winrate", 0)
+                        trades = result.get("trades", 0)
+                        conf = result.get("learned_thresholds", {}).get("high_winrate_min_confidence", 0)
+                        self._message(
+                            f"History analyse complete: {trades} trades, {wr:.1f}% WR | "
+                            f"CONFIG patched → confidence≥{conf:.0f}%"
+                        )
+                    else:
+                        self._message("History analyser: no MT5 history available yet — will retry next startup.")
+                except Exception as exc:
+                    self._message(f"History analyser error: {exc}")
+            threading.Thread(target=_run_history, daemon=True).start()
         except Exception as exc:
             self.store = None
             self.mysql_connected = False
@@ -667,6 +690,8 @@ class TerminalHandler(BaseHTTPRequestHandler):
             self._json(RUNTIME.filter_stats_payload())
         elif path == "/api/health":                # FEATURE 6
             self._json(RUNTIME.health_payload())
+        elif path == "/api/backtest_result":       # AUTO HISTORY LEARNING
+            self._json(RUNTIME._backtest_result or {"status": "not_run_yet"})
         else:
             self.send_response(404)
             self.end_headers()
@@ -819,6 +844,14 @@ pre{background:#0d1117;padding:8px;border-radius:4px;overflow:auto;max-height:20
   </div>
 </div>
 
+<!-- History Backtest Panel -->
+<div class="grid">
+  <div class="card card-full">
+    <h3>&#128202; History Backtest — Auto-Learned Thresholds</h3>
+    <div id="backtestResult" class="muted">Loading history analysis...</div>
+  </div>
+</div>
+
 <!-- Positions -->
 <div class="grid">
   <div class="card card-full">
@@ -958,9 +991,49 @@ async function resumeTrading(){
 async function tick(){
   if(tickBusy)return;
   tickBusy=true;
-  try{await loadState();await loadTrades();}
+  try{
+    await loadState();
+    await loadTrades();
+    await loadBacktest();
+  }
   catch(e){document.getElementById('status').textContent='Error: '+e.message;}
   finally{tickBusy=false;}
+}
+
+async function loadBacktest(){
+  try{
+    const res=await fetch('/api/backtest_result',{cache:'no-store'});
+    const data=await res.json();
+    const el=document.getElementById('backtestResult');
+    if(!el)return;
+    if(data.status==='not_run_yet'){
+      el.innerHTML='<span class="muted">Running history analysis in background — check the log for progress.</span>';
+      return;
+    }
+    const t=data.learned_thresholds||{};
+    const ss=data.session_stats||{};
+    const sessHtml=Object.entries(ss).map(([k,v])=>`<span style="margin-right:12px"><b>${k.replace(/_/g,' ')}</b>: ${v.trades}t ${fmt(v.winrate,1)}% WR</span>`).join('');
+    el.innerHTML=`
+      <div style="display:flex;gap:20px;flex-wrap:wrap;margin-bottom:8px">
+        <div><span class="muted">Trades:</span> <b>${data.trades}</b></div>
+        <div><span class="muted">Win Rate:</span> <b class="${data.winrate>=65?'buy':'sell'}">${fmt(data.winrate,1)}%</b></div>
+        <div><span class="muted">Profit Factor:</span> <b>${fmt(data.profit_factor)}</b></div>
+        <div><span class="muted">Sharpe:</span> <b>${fmt(data.sharpe)}</b></div>
+        <div><span class="muted">Max DD:</span> <b class="sell">${fmt(data.max_drawdown)}</b></div>
+        <div><span class="muted">Filtered:</span> <b>${data.filtered_count}</b></div>
+        <div><span class="muted">Run at:</span> <b>${data.run_at||'—'}</b></div>
+      </div>
+      <div style="margin-bottom:6px"><span class="muted">Sessions:</span> ${sessHtml}</div>
+      <div style="display:flex;gap:20px;flex-wrap:wrap">
+        <div><span class="muted">→ Confidence floor:</span> <span class="upgrade">${fmt(t.high_winrate_min_confidence,1)}%</span></div>
+        <div><span class="muted">→ Min RR:</span> <span class="upgrade">${fmt(t.high_winrate_min_rr)}</span></div>
+        <div><span class="muted">→ ADX threshold:</span> <span class="upgrade">${fmt(t.sideways_adx_threshold,1)}</span></div>
+        <div><span class="muted">→ Max SL pts:</span> <span class="upgrade">${fmt(t.micro_max_sl_points,1)}</span></div>
+        <div><span class="muted">→ Best session:</span> <span class="buy">${t.best_session||'—'}</span></div>
+      </div>
+      ${(t.notes||[]).length?'<div style="margin-top:6px">'+t.notes.map(n=>`<div class="muted" style="font-size:11px">• ${n}</div>`).join('')+'</div>':''}
+    `;
+  }catch(e){}
 }
 
 tick();initTradingView();updateSoundState();setInterval(tick,250);
