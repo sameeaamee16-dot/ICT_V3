@@ -44,7 +44,7 @@ Usage (from code):
     result = runner.run_if_needed()   # patches CONFIG automatically
 """
 
-from __future__ import annotations
+
 
 import json
 import os
